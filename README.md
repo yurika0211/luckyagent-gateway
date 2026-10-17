@@ -74,4 +74,4 @@ imports are forwarding aliases; platform implementations have a single owner
 in this module. Standard `log/slog` uses the host's configured default logger.
 
 This project retains the original MIT license and attribution. Install the
-current extraction with `go get github.com/yurika0211/luckyagent-gateway@v0.2.1`.
+current extraction with `go get github.com/yurika0211/luckyagent-gateway@v0.2.2`.

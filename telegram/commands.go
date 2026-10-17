@@ -40,7 +40,7 @@ func telegramCommandSpecs() []telegramCommandSpec {
 		{Command: "tool", Usage: "/tool <name>", Description: "Show a tool's details", Group: commandGroupSystem},
 		{Command: "skills", Usage: "/skills [page|all]", Description: "List loaded skills", Group: commandGroupSystem},
 		{Command: "skill", Usage: "/skill <name>", Description: "Show a skill's details", Group: commandGroupSystem},
-		{Command: "mcp", Usage: "/mcp <name> <url> [api_key]", Description: "Connect an MCP server", Group: commandGroupSystem},
+		{Command: "mcp", Usage: "/mcp status | connect/refresh/disconnect <name>", Description: "Manage MCP servers", Group: commandGroupSystem},
 		{Command: "approve", Usage: "/approve <tool>", Description: "Auto-approve a tool", Group: commandGroupSystem},
 		{Command: "deny", Usage: "/deny <tool>", Description: "Deny a tool", Group: commandGroupSystem},
 		{Command: "cron", Usage: "/cron [list|add|remove|pause|resume|start|stop]", Description: "Manage scheduled tasks", Group: commandGroupSystem},
