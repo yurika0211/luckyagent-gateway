@@ -2,7 +2,7 @@
 
 An independent Go module for messaging transports, extracted from LuckyAgent.
 It contains platform protocols and presentation utilities without importing the
-LuckyAgent runtime, model providers, memory store, tools, or application config.
+LuckyAgent runtime, model providers, memory store or application config.
 
 ```text
 github.com/yurika0211/luckyagent-gateway
@@ -12,6 +12,9 @@ The root package is named `gateway`. Platform adapters live in `telegram`,
 `qqofficial`, `napcat`, `feishu`, `weixin`, and `openclawweixin`. `collector`
 collects message segments, and `turn` defines neutral input, attachment, event,
 and chat-runtime contracts shared by the host and API transports.
+`telegram/presentation` renders tool/Skill metadata, progress cards and memory
+traces using the public `luckyagent-tools` contracts. NapCat group history uses
+the same module's neutral `chat` values, so the host needs no duplicate DTOs.
 
 ## Use a platform adapter
 
@@ -70,5 +73,5 @@ attachment representation and stream event order. LuckyAgent's old internal
 imports are forwarding aliases; platform implementations have a single owner
 in this module. Standard `log/slog` uses the host's configured default logger.
 
-This project retains the original MIT license and attribution. The initial
-release target is `v0.1.0`; a local Git tag alone does not publish that release.
+This project retains the original MIT license and attribution. Install the
+current extraction with `go get github.com/yurika0211/luckyagent-gateway@v0.2.1`.

@@ -1,0 +1,227 @@
+package presentation
+
+import (
+	"fmt"
+	"github.com/stretchr/testify/assert"
+	"github.com/yurika0211/luckyagent-tools/memory"
+	"testing"
+)
+
+func TestHumanizeToolCall(t *testing.T) {
+	tests := []struct {
+		name string
+		tool string
+		args string
+		want string
+	}{
+		{
+			name: "web search",
+			tool: "web_search",
+			args: `{"query":"golang context cancel"}`,
+			want: "正在联网搜索：",
+		},
+		{
+			name: "shell cmd",
+			tool: "shell",
+			args: `{"cmd":"go test ./..."}`,
+			want: "正在执行命令：",
+		},
+		{
+			name: "file read",
+			tool: "file_read",
+			args: `{"path":"/tmp/demo.txt"}`,
+			want: "正在读取文件：/tmp/demo.txt",
+		},
+		{
+			name: "unknown fallback",
+			tool: "custom_tool",
+			args: `{"name":"demo-task"}`,
+			want: "正在调用工具 custom_tool",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := HumanizeToolCall(tt.tool, tt.args)
+			assert.Contains(t, got, tt.want)
+		})
+	}
+}
+
+func TestHumanizeProgressNarrative(t *testing.T) {
+	t.Run("thinking", func(t *testing.T) {
+		got := HumanizeThinkingProgress("先看下 tasks 目录状态")
+		assert.Contains(t, got, "先整理一下当前思路：")
+	})
+
+	t.Run("internal thinking marker is hidden", func(t *testing.T) {
+		got := HumanizeThinkingProgress("Thinking... (round 2)")
+		assert.Equal(t, "", got)
+	})
+
+	t.Run("tool call narrative", func(t *testing.T) {
+		got := HumanizeToolCallProgress(2, "file_read", `{"path":"tasks/QUEUE.md"}`)
+		assert.Contains(t, got, "先查看文件")
+		assert.Contains(t, got, "tasks/QUEUE.md")
+	})
+
+	t.Run("skill narrative", func(t *testing.T) {
+		got := HumanizeToolCallProgress(1, "skill_run", `{"skill_name":"deep-research"}`)
+		assert.Contains(t, got, "处理链路")
+		assert.NotContains(t, got, "deep-research")
+	})
+
+	t.Run("tool result narrative", func(t *testing.T) {
+		got := HumanizeToolResultProgress(3, "web_search", "ok")
+		assert.Contains(t, got, "搜索结果已经拿到")
+	})
+}
+
+func TestTelegramProgressCards(t *testing.T) {
+	t.Run("thinking card", func(t *testing.T) {
+		got := RenderTelegramThinkingCard("先看下 tasks 目录状态")
+		assert.Contains(t, got, "<b>💭 Reasoning Trace</b>")
+		assert.Contains(t, got, "<blockquote expandable>")
+		assert.Contains(t, got, "先看下 tasks 目录状态")
+	})
+
+	t.Run("summary card removes blank lines", func(t *testing.T) {
+		got := RenderTelegramSummaryCard("First line\n\nSecond line")
+		assert.Contains(t, got, "First line\nSecond line")
+		assert.NotContains(t, got, "First line\n\nSecond line")
+	})
+
+	t.Run("history card joins without blank lines", func(t *testing.T) {
+		got := RenderTelegramProgressHistoryCard([]string{"One", "Two"})
+		assert.Contains(t, got, "One\nTwo")
+		assert.NotContains(t, got, "One\n\nTwo")
+	})
+
+	t.Run("internal thinking marker is suppressed", func(t *testing.T) {
+		got := RenderTelegramThinkingCard("Thinking... (round 2)")
+		assert.Equal(t, "", got)
+	})
+
+	t.Run("tool trace card", func(t *testing.T) {
+		got := RenderTelegramToolTraceCard([]TelegramToolTraceStep{
+			{Name: "web_search", Args: `{"query":"luckyagent telegram"}`, Result: "Results for: luckyagent telegram", Success: true},
+			{Name: "file_read", Args: `{"path":"internal/gateway/telegram/handler.go"}`, Result: "package telegram", Success: true},
+		})
+		assert.Contains(t, got, "<b>🛠 Tool Trace</b>")
+		assert.Contains(t, got, "1. ✅")
+		assert.Contains(t, got, "web_search")
+		assert.Contains(t, got, "搜索了「luckyagent telegram」")
+		assert.Contains(t, got, "2. ✅")
+		assert.Contains(t, got, "file_read")
+		assert.Contains(t, got, "读取了 internal/gateway/telegram/handler.go")
+	})
+
+	t.Run("tool trace keeps executable skill tools compact", func(t *testing.T) {
+		got := RenderTelegramToolTraceCard([]TelegramToolTraceStep{
+			{Name: "skill_obsidian_run", Args: `{"name":"vault"}`, Result: "ok", Success: true},
+			{Name: "skill_read", Args: `{"name":"obsidian"}`, Result: "ok", Success: true},
+		})
+		assert.Contains(t, got, "skill_obsidian_run")
+		assert.Contains(t, got, "skill_read")
+		assert.Contains(t, got, "1. ✅")
+		assert.Contains(t, got, "2. ✅")
+	})
+
+	t.Run("detailed tool trace exposes expandable metadata", func(t *testing.T) {
+		got := RenderTelegramToolTraceCardWithDetails([]TelegramToolTraceStep{{
+			Name:    "terminal",
+			Args:    `{"command":"go test ./...","workdir":"/repo"}`,
+			Result:  "error: test failed",
+			Success: false,
+		}}, true)
+		assert.Contains(t, got, "在 /repo 执行 go test ./...")
+		assert.Contains(t, got, "<blockquote expandable>")
+		assert.Contains(t, got, "错误：")
+	})
+
+	t.Run("configured tool template", func(t *testing.T) {
+		got := RenderTelegramToolTraceCardWithTemplateDetails([]TelegramToolTraceStep{{
+			Name:    "file_read",
+			Args:    `{"path":"config.json"}`,
+			Result:  "ok",
+			Success: true,
+		}}, false, map[string]string{"file_read": "已检查 {path}"})
+		assert.Contains(t, got, "已检查 config.json")
+	})
+
+	t.Run("tool trace omits agent orchestration tools", func(t *testing.T) {
+		got := RenderTelegramToolTraceCard([]TelegramToolTraceStep{
+			{Name: "delegate_task", Args: `{"task":"inspect repo"}`, Result: "ok", Success: true},
+			{Name: "autonomy_worker_spawn", Args: `{"task":"nightly replay"}`, Result: "ok", Success: true},
+			{Name: "web_search", Args: `{"query":"agent"}`, Result: "ok", Success: true},
+		})
+		assert.Contains(t, got, "Tool Trace")
+		assert.Contains(t, got, "web_search")
+		assert.NotContains(t, got, "delegate")
+		assert.NotContains(t, got, "autonomy")
+	})
+
+	t.Run("agent trace shows orchestration tools", func(t *testing.T) {
+		got := RenderTelegramAgentTraceCard([]TelegramToolTraceStep{
+			{Name: "delegate_task", Args: `{"task":"inspect repo"}`, Result: "ok", Success: true},
+			{Name: "autonomy_worker_spawn", Args: `{"task":"nightly replay"}`, Result: "ok", Success: true},
+			{Name: "heartbeat_trigger", Args: `{"task":"tick"}`, Result: "error: timeout", Success: false},
+			{Name: "web_search", Args: `{"query":"agent"}`, Result: "ok", Success: true},
+		})
+		assert.Contains(t, got, "<b>🧭 Agent Trace</b>")
+		assert.Contains(t, got, "Task Overview · total: 3 · completed: 2 · failed: 1")
+		assert.Contains(t, got, "delegate")
+		assert.Contains(t, got, "inspect repo")
+		assert.Contains(t, got, "autonomy")
+		assert.Contains(t, got, "nightly replay")
+		assert.Contains(t, got, "heartbeat")
+		assert.Contains(t, got, "⚠️")
+		assert.Contains(t, got, "Error: error: timeout")
+		assert.Contains(t, got, "Done · 3 agent steps · 2 succeeded, 1 failed")
+		assert.NotContains(t, got, "web_search")
+	})
+
+	t.Run("agent trace summary counts collapsed tasks", func(t *testing.T) {
+		steps := make([]TelegramToolTraceStep, 0, 7)
+		for i := 0; i < 7; i++ {
+			steps = append(steps, TelegramToolTraceStep{
+				Name:    "delegate_task",
+				Args:    fmt.Sprintf(`{"task":"task-%d"}`, i+1),
+				Result:  "ok",
+				Success: true,
+			})
+		}
+		got := RenderTelegramAgentTraceCard(steps)
+		assert.Contains(t, got, "Done · 7 agent steps · 7 succeeded, 0 failed")
+		assert.Contains(t, got, "task-1")
+		assert.Contains(t, got, "task-6")
+		assert.Contains(t, got, "Task Overview · total: 7 · completed: 7 · failed: 0")
+		assert.NotContains(t, got, "task-7")
+	})
+
+	t.Run("memory trace card summarizes results and hops", func(t *testing.T) {
+		trace := memory.SearchTrace{
+			Query:      "Outdoor walks",
+			Source:     "memory-vault",
+			GraphDepth: 1,
+			DurationMS: 12,
+			Results: []memory.SearchTraceResult{
+				{Rank: 1, SearchTraceNode: memory.SearchTraceNode{ID: "a", Ref: "20_Projects/a.md#mem-a", Category: "plan", Tier: "medium", Score: 1.2, DirectScore: 1.2}},
+				{Rank: 2, SearchTraceNode: memory.SearchTraceNode{ID: "b", Ref: "50_Facts/b.md#mem-b", Category: "health", Tier: "long", Score: 0.4, GraphScore: 0.4}},
+			},
+			Hops: []memory.SearchTraceHop{
+				{Depth: 1, FromID: "a", ToID: "b", ToRef: "50_Facts/b.md#mem-b", Via: "Daughter", Kind: "wikilink_target", Boost: 0.31},
+			},
+			Temporal: []string{"Superseded memory ignored: old.md."},
+		}
+		got := RenderTelegramMemoryTraceCard(trace, "summary", 1, 1)
+		assert.Contains(t, got, "<b>Memory Trace</b>")
+		assert.Contains(t, got, "query: Outdoor walks")
+		assert.Contains(t, got, "direct:")
+		assert.Contains(t, got, "[1] 20_Projects/a.md#mem-a (direct plan/medium score=1.20)")
+		assert.Contains(t, got, "... 1 more nodes")
+		assert.Contains(t, got, "paths:")
+		assert.Contains(t, got, "20_Projects/a.md#mem-a --[d1 wikilink_target:Daughter +0.31]--&gt; 50_Facts/b.md#mem-b")
+		assert.Contains(t, got, "notes:")
+	})
+}

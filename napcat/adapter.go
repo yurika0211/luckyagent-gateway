@@ -1,6 +1,7 @@
 package napcat
 
 import (
+ "github.com/yurika0211/luckyagent-tools/chat"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -78,22 +79,9 @@ type actionResponse struct {
 	Echo    string          `json:"echo"`
 }
 
-// GroupMessage is the privacy-minimized representation of a OneBot group
-// history item. It deliberately does not expose the sender's QQ number.
-type GroupMessage struct {
-	MessageID string    `json:"message_id"`
-	UserName  string    `json:"user_name"`
-	Content   string    `json:"content"`
-	Time      time.Time `json:"time"`
-}
+type GroupMessage = chat.GroupMessage
 
-// GroupInfo is the small subset of OneBot group metadata needed to resolve a
-// group target and label a history result.
-type GroupInfo struct {
-	GroupID     string `json:"group_id"`
-	Name        string `json:"group_name"`
-	MemberCount int    `json:"member_count,omitempty"`
-}
+type GroupInfo = chat.GroupInfo
 
 // Adapter implements gateway.Gateway for NapCat's OneBot v11 reverse WebSocket.
 type Adapter struct {
