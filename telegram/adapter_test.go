@@ -1,0 +1,334 @@
+package telegram
+
+import (
+	"context"
+	"github.com/stretchr/testify/assert"
+	"github.com/yurika0211/luckyagent-gateway"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestDefaultConfig(t *testing.T) {
+	cfg := DefaultConfig()
+	assert.Equal(t, 4000, cfg.MaxMessageLen)
+	assert.Equal(t, 1, cfg.RateLimit)
+	assert.Equal(t, 30, cfg.PollTimeout)
+}
+
+func TestConfigIsChatAllowed(t *testing.T) {
+	// Empty whitelist = allow all
+	cfg := Config{}
+	assert.True(t, cfg.IsChatAllowed("123"))
+	assert.True(t, cfg.IsChatAllowed("any"))
+
+	// With whitelist
+	cfg = Config{AllowedChats: []string{"123", "456"}}
+	assert.True(t, cfg.IsChatAllowed("123"))
+	assert.True(t, cfg.IsChatAllowed("456"))
+	assert.False(t, cfg.IsChatAllowed("789"))
+}
+
+func TestConfigIsAdmin(t *testing.T) {
+	cfg := Config{AdminIDs: []string{"1", "2"}}
+	assert.True(t, cfg.IsAdmin("1"))
+	assert.True(t, cfg.IsAdmin("2"))
+	assert.False(t, cfg.IsAdmin("3"))
+}
+
+func TestNewAdapter(t *testing.T) {
+	cfg := Config{Token: "test-token"}
+	adapter := NewAdapter(cfg)
+	assert.NotNil(t, adapter)
+	assert.Equal(t, "telegram", adapter.Name())
+	assert.False(t, adapter.IsRunning())
+}
+
+func TestNewAdapterDefaults(t *testing.T) {
+	cfg := Config{Token: "test-token"} // MaxMessageLen, RateLimit, PollTimeout all zero
+	adapter := NewAdapter(cfg)
+	assert.Equal(t, 4000, adapter.cfg.MaxMessageLen)
+	assert.Equal(t, 1, adapter.cfg.RateLimit)
+	assert.Equal(t, 30, adapter.cfg.PollTimeout)
+}
+
+func TestNewHTTPClientNoProxy(t *testing.T) {
+	adapter := NewAdapter(Config{Token: "test-token"})
+	client, err := adapter.newHTTPClient()
+	assert.NoError(t, err)
+	assert.NotNil(t, client)
+	assert.Nil(t, client.Transport)
+}
+
+func TestNewHTTPClientHTTPProxy(t *testing.T) {
+	adapter := NewAdapter(Config{Token: "test-token", Proxy: "http://127.0.0.1:7897"})
+	client, err := adapter.newHTTPClient()
+	assert.NoError(t, err)
+	assert.NotNil(t, client)
+
+	transport, ok := client.Transport.(*http.Transport)
+	if assert.True(t, ok) {
+		reqURL, parseErr := url.Parse("https://api.telegram.org")
+		assert.NoError(t, parseErr)
+		proxyURL, proxyErr := transport.Proxy(&http.Request{URL: reqURL})
+		assert.NoError(t, proxyErr)
+		if assert.NotNil(t, proxyURL) {
+			assert.Equal(t, "http://127.0.0.1:7897", proxyURL.String())
+		}
+	}
+}
+
+func TestNewHTTPClientSOCKS5Proxy(t *testing.T) {
+	adapter := NewAdapter(Config{Token: "test-token", Proxy: "socks5://127.0.0.1:7890"})
+	client, err := adapter.newHTTPClient()
+	assert.NoError(t, err)
+	assert.NotNil(t, client)
+
+	transport, ok := client.Transport.(*http.Transport)
+	if assert.True(t, ok) {
+		assert.Nil(t, transport.Proxy)
+		assert.NotNil(t, transport.DialContext)
+	}
+}
+
+func TestNewHTTPClientInvalidProxy(t *testing.T) {
+	adapter := NewAdapter(Config{Token: "test-token", Proxy: "://bad proxy"})
+	client, err := adapter.newHTTPClient()
+	assert.Nil(t, client)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "parse proxy URL")
+}
+
+func TestNewHTTPClientUnsupportedProxyScheme(t *testing.T) {
+	adapter := NewAdapter(Config{Token: "test-token", Proxy: "ftp://127.0.0.1:21"})
+	client, err := adapter.newHTTPClient()
+	assert.Nil(t, client)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported proxy scheme")
+}
+
+func TestLifecycleRoundTripperCancelsActiveRequest(t *testing.T) {
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	lifecycleCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	transport := &lifecycleRoundTripper{ctx: lifecycleCtx, base: http.DefaultTransport}
+	req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, roundTripErr := transport.RoundTrip(req)
+		done <- roundTripErr
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("request did not reach test server")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected request cancellation error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request was not canceled promptly")
+	}
+}
+
+func TestAdapterStartNoToken(t *testing.T) {
+	cfg := Config{Token: ""}
+	adapter := NewAdapter(cfg)
+	err := adapter.Start(nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "bot token is required")
+}
+
+func TestAdapterStop(t *testing.T) {
+	cfg := Config{Token: "test-token"}
+	adapter := NewAdapter(cfg)
+
+	// Stop without start should not panic
+	err := adapter.Stop()
+	assert.NoError(t, err)
+}
+
+func TestAdapterSendNotRunning(t *testing.T) {
+	cfg := Config{Token: "test-token"}
+	adapter := NewAdapter(cfg)
+
+	err := adapter.Send(nil, "123", "hello")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not running")
+}
+
+func TestAdapterSendWithReplyNotRunning(t *testing.T) {
+	cfg := Config{Token: "test-token"}
+	adapter := NewAdapter(cfg)
+
+	err := adapter.SendWithReply(nil, "123", "1", "hello")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not running")
+}
+
+func TestSplitMessage(t *testing.T) {
+	cfg := Config{Token: "test", MaxMessageLen: 10}
+	adapter := NewAdapter(cfg)
+
+	// Short message
+	chunks := adapter.splitMessage("hello")
+	assert.Len(t, chunks, 1)
+	assert.Equal(t, "hello", chunks[0])
+
+	// Long message
+	longMsg := "abcdefghij" + "klmnopqrst"
+	chunks = adapter.splitMessage(longMsg)
+	assert.Len(t, chunks, 2)
+
+	// Message with newlines
+	msgWithNewlines := "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11"
+	adapter.cfg.MaxMessageLen = 30
+	chunks = adapter.splitMessage(msgWithNewlines)
+	assert.GreaterOrEqual(t, len(chunks), 2)
+}
+
+func TestSplitMessageExactBoundary(t *testing.T) {
+	cfg := Config{Token: "test", MaxMessageLen: 5}
+	adapter := NewAdapter(cfg)
+
+	chunks := adapter.splitMessage("abcde")
+	assert.Len(t, chunks, 1)
+	assert.Equal(t, "abcde", chunks[0])
+}
+
+func TestSplitTelegramCaptionPreservesFullOverflow(t *testing.T) {
+	caption := " \n" + strings.Repeat("caption ", 200) + "\n "
+	inline, overflow := splitTelegramCaption(caption)
+	if inline != "" {
+		t.Fatalf("inline caption = %q, want empty for overflow", inline)
+	}
+	if overflow != caption {
+		t.Fatalf("overflow caption was changed")
+	}
+}
+
+func TestSplitMessageRespectsNewlines(t *testing.T) {
+	cfg := Config{Token: "test", MaxMessageLen: 15}
+	adapter := NewAdapter(cfg)
+
+	msg := "line1\nline2\nline3\nline4"
+	chunks := adapter.splitMessage(msg)
+	// Should split at newline boundaries
+	for _, chunk := range chunks {
+		assert.LessOrEqual(t, len(chunk), 15)
+	}
+	// Reassembled should equal original
+	assert.Equal(t, msg, joinChunks(chunks))
+}
+
+func TestSplitMessagePreservesFencedCodeBlocks(t *testing.T) {
+	cfg := Config{Token: "test", MaxMessageLen: 48}
+	adapter := NewAdapter(cfg)
+
+	msg := "before\n```go\n" +
+		strings.Repeat("fmt.Println(\"hello world\")\n", 4) +
+		"```\nafter"
+
+	chunks := adapter.splitMessage(msg)
+	assert.GreaterOrEqual(t, len(chunks), 2)
+
+	for _, chunk := range chunks {
+		assert.LessOrEqual(t, len(chunk), 48)
+		rendered := formatTelegramRichText(chunk)
+		assert.Equal(t, strings.Count(rendered, "<pre>"), strings.Count(rendered, "</pre>"))
+		assert.Equal(t, strings.Count(rendered, "<code"), strings.Count(rendered, "</code>"))
+	}
+}
+
+func TestSplitMessageRepairsDanglingFenceBeforeReferences(t *testing.T) {
+	cfg := Config{Token: "test", MaxMessageLen: 80}
+	adapter := NewAdapter(cfg)
+
+	msg := "讲解：\n```asm\n" +
+		strings.Repeat("mov %rax, %rbx\n", 6) +
+		"\nReferences:\n[1] Local file. README.md"
+
+	chunks := adapter.splitMessage(msg)
+	assert.GreaterOrEqual(t, len(chunks), 2)
+
+	rendered := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		assert.LessOrEqual(t, len(chunk), 80)
+		html := formatTelegramRichText(chunk)
+		assert.Equal(t, strings.Count(html, "<pre>"), strings.Count(html, "</pre>"))
+		assert.Equal(t, strings.Count(html, "<code"), strings.Count(html, "</code>"))
+		rendered = append(rendered, html)
+	}
+	combined := strings.Join(rendered, "\n")
+	assert.Contains(t, combined, "References:")
+	assert.NotContains(t, combined, "<code>References:")
+	assert.NotContains(t, combined, "README.md</code></pre>")
+}
+
+func TestSplitHTMLMessageClosesPreCodeChunks(t *testing.T) {
+	cfg := Config{Token: "test", MaxMessageLen: 64}
+	adapter := NewAdapter(cfg)
+
+	msg := "<b>Trace</b>\n<pre><code>" + strings.Repeat("line with output\n", 8) + "</code></pre>\nafter"
+
+	chunks := adapter.splitHTMLMessage(msg)
+	assert.GreaterOrEqual(t, len(chunks), 2)
+
+	combined := strings.Join(chunks, "")
+	combined = strings.ReplaceAll(combined, "</code></pre><pre><code>", "")
+	assert.Equal(t, msg, combined)
+	for _, chunk := range chunks {
+		assert.LessOrEqual(t, len(chunk), 64)
+		assert.Equal(t, strings.Count(chunk, "<pre>"), strings.Count(chunk, "</pre>"))
+		assert.Equal(t, strings.Count(chunk, "<code>"), strings.Count(chunk, "</code>"))
+	}
+}
+
+func joinChunks(chunks []string) string {
+	result := ""
+	for _, c := range chunks {
+		result += c
+	}
+	return result
+}
+
+func TestConvertMessagePrivate(t *testing.T) {
+	adapter := NewAdapter(Config{Token: "test"})
+
+	// We can't easily create a real tgbotapi.Message, so we test the type mapping
+	// through the public interface. The convertMessage method is tested indirectly.
+	assert.NotNil(t, adapter)
+}
+
+func TestSetHandler(t *testing.T) {
+	adapter := NewAdapter(Config{Token: "test"})
+
+	adapter.SetHandler(func(_ context.Context, _ *gateway.Message) error {
+		return nil
+	})
+
+	assert.NotNil(t, adapter.handler)
+}
+
+func TestAdapterName(t *testing.T) {
+	adapter := NewAdapter(Config{Token: "test"})
+	assert.Equal(t, "telegram", adapter.Name())
+}

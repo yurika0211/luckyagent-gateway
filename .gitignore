@@ -1,0 +1,4 @@
+coverage.out
+*.test
+go.work
+go.work.sum

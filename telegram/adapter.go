@@ -1,0 +1,1933 @@
+package telegram
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	xproxy "golang.org/x/net/proxy"
+
+	"github.com/yurika0211/luckyagent-gateway"
+)
+
+const defaultAttachmentDownloadLimit = 1 << 30
+const internalOutputFilteredFallback = "已完成处理。内部工具调用日志已自动隐藏。"
+
+// Adapter implements gateway.Gateway for Telegram.
+type Adapter struct {
+	cfg     Config
+	bot     *tgbotapi.BotAPI
+	running bool
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+
+	mu              sync.RWMutex
+	handler         gateway.MessageHandler
+	callbackHandler func(context.Context, *tgbotapi.CallbackQuery)
+	rateLimit       map[string]*rateBucket
+	threadIDs       map[string]string
+
+	// Bot username for mention detection
+	botUsername string
+}
+
+// rateBucket implements simple per-chat rate limiting.
+type rateBucket struct {
+	lastSent time.Time
+}
+
+// NewAdapter creates a new Telegram adapter.
+func NewAdapter(cfg Config) *Adapter {
+	if cfg.MaxMessageLen <= 0 {
+		cfg.MaxMessageLen = 4000
+	}
+	if cfg.RateLimit <= 0 {
+		cfg.RateLimit = 1
+	}
+	if cfg.PollTimeout <= 0 {
+		cfg.PollTimeout = 30
+	}
+	if cfg.AttachmentDownloadLimit <= 0 {
+		cfg.AttachmentDownloadLimit = defaultAttachmentDownloadLimit
+	}
+	if cfg.AttachmentDownloadTimeout <= 0 {
+		cfg.AttachmentDownloadTimeout = 30
+	}
+
+	return &Adapter{
+		cfg:       cfg,
+		rateLimit: make(map[string]*rateBucket),
+		threadIDs: make(map[string]string),
+	}
+}
+
+// Name returns the platform name.
+func (a *Adapter) Name() string {
+	return "telegram"
+}
+
+// SetHandler sets the message handler callback.
+func (a *Adapter) SetHandler(handler gateway.MessageHandler) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.handler = handler
+}
+
+// SetCallbackHandler registers the handler for inline-keyboard callback
+// queries. It is intentionally Telegram-specific and does not widen the
+// generic gateway interface.
+func (a *Adapter) SetCallbackHandler(handler func(context.Context, *tgbotapi.CallbackQuery)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.callbackHandler = handler
+}
+
+// Start connects to Telegram and begins polling for updates.
+func (a *Adapter) Start(ctx context.Context) error {
+	if a.cfg.Token == "" {
+		return fmt.Errorf("telegram: bot token is required")
+	}
+
+	a.mu.Lock()
+	if a.running {
+		a.mu.Unlock()
+		return nil
+	}
+	a.mu.Unlock()
+
+	pollCtx, cancel := context.WithCancel(ctx)
+	client, err := a.newHTTPClientWithContext(pollCtx)
+	if err != nil {
+		cancel()
+		return err
+	}
+
+	bot, err := tgbotapi.NewBotAPIWithClient(a.cfg.Token, tgbotapi.APIEndpoint, client)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("telegram: create bot: %w", err)
+	}
+
+	a.mu.Lock()
+	// Re-check after slow network setup to avoid double pollers.
+	if a.running {
+		a.mu.Unlock()
+		cancel()
+		return nil
+	}
+	a.bot = bot
+	a.botUsername = bot.Self.UserName
+	a.cancel = cancel
+	a.running = true
+	a.mu.Unlock()
+
+	if err := a.registerBotCommands(); err != nil {
+		fmt.Printf("[telegram] warning: failed to register bot commands: %v\n", err)
+	}
+
+	// Start polling in background
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		a.poll(pollCtx)
+	}()
+
+	return nil
+}
+
+func (a *Adapter) registerBotCommands() error {
+	if a == nil || a.bot == nil {
+		return fmt.Errorf("telegram: bot is not initialized")
+	}
+	commands := telegramBotCommands()
+	if len(commands) == 0 {
+		return nil
+	}
+	_, err := a.bot.Request(tgbotapi.NewSetMyCommands(commands...))
+	return err
+}
+
+func (a *Adapter) newHTTPClient() (*http.Client, error) {
+	if strings.TrimSpace(a.cfg.Proxy) == "" {
+		return &http.Client{}, nil
+	}
+
+	proxyURL, err := url.Parse(a.cfg.Proxy)
+	if err != nil {
+		return nil, fmt.Errorf("telegram: parse proxy URL: %w", err)
+	}
+
+	transport := &http.Transport{}
+
+	switch strings.ToLower(proxyURL.Scheme) {
+	case "http", "https":
+		transport.Proxy = http.ProxyURL(proxyURL)
+	case "socks5", "socks5h":
+		baseDialer := &net.Dialer{}
+		dialer, err := xproxy.FromURL(proxyURL, baseDialer)
+		if err != nil {
+			return nil, fmt.Errorf("telegram: create SOCKS5 proxy dialer: %w", err)
+		}
+		if contextDialer, ok := dialer.(xproxy.ContextDialer); ok {
+			transport.DialContext = contextDialer.DialContext
+		} else {
+			transport.DialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
+			}
+		}
+	default:
+		return nil, fmt.Errorf("telegram: unsupported proxy scheme %q", proxyURL.Scheme)
+	}
+
+	return &http.Client{Transport: transport}, nil
+}
+
+// newHTTPClientWithContext binds Telegram API requests to the adapter
+// lifecycle while preserving per-request cancellation and deadlines.
+func (a *Adapter) newHTTPClientWithContext(ctx context.Context) (*http.Client, error) {
+	client, err := a.newHTTPClient()
+	if err != nil {
+		return nil, err
+	}
+	base := client.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	client.Transport = &lifecycleRoundTripper{ctx: ctx, base: base}
+	return client, nil
+}
+
+type lifecycleRoundTripper struct {
+	ctx  context.Context
+	base http.RoundTripper
+}
+
+func (t *lifecycleRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t == nil || t.base == nil {
+		return nil, fmt.Errorf("telegram: HTTP transport is not initialized")
+	}
+	if t.ctx == nil {
+		return t.base.RoundTrip(req)
+	}
+
+	requestCtx, cancel := context.WithCancel(req.Context())
+	stop := context.AfterFunc(t.ctx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+	return t.base.RoundTrip(req.Clone(requestCtx))
+}
+
+func parseReplyToMessageID(replyToMsgID string) (int, error) {
+	if strings.TrimSpace(replyToMsgID) == "" {
+		return 0, nil
+	}
+
+	replyToID, err := strconv.Atoi(replyToMsgID)
+	if err != nil {
+		return 0, fmt.Errorf("telegram: invalid reply-to message ID %q: %w", replyToMsgID, err)
+	}
+	return replyToID, nil
+}
+
+func telegramRequestFileData(source string) (tgbotapi.RequestFileData, error) {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return nil, fmt.Errorf("telegram: empty media source")
+	}
+
+	if strings.HasPrefix(strings.ToLower(source), "sandbox:/") {
+		source = strings.TrimPrefix(source, "sandbox:")
+	}
+
+	if strings.HasPrefix(strings.ToLower(source), "file://") {
+		u, err := url.Parse(source)
+		if err != nil {
+			return nil, fmt.Errorf("telegram: parse file URL: %w", err)
+		}
+		if strings.TrimSpace(u.Path) == "" {
+			return nil, fmt.Errorf("telegram: file URL has empty path")
+		}
+		if _, err := os.Stat(u.Path); err != nil {
+			return nil, fmt.Errorf("telegram: stat media file: %w", err)
+		}
+		return tgbotapi.FilePath(u.Path), nil
+	}
+
+	if u, err := url.Parse(source); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
+		return tgbotapi.FileURL(source), nil
+	}
+
+	info, err := os.Stat(source)
+	if err != nil {
+		return nil, fmt.Errorf("telegram: stat media file: %w", err)
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("telegram: media source %q is a directory", source)
+	}
+	return tgbotapi.FilePath(source), nil
+}
+
+// splitTelegramCaption splits a formatted (HTML) caption into what fits
+// inline on a photo/document (Telegram's 1024-char caption limit) and an
+// overflow remainder. Unlike a hard truncation, no content is dropped: when
+// the caption doesn't fit, it is sent whole as the overflow and the inline
+// caption is left empty, so the caller can follow up with a separate
+// full-text message instead of mangling HTML tags mid-cut.
+func splitTelegramCaption(caption string) (inline string, overflow string) {
+	if len(caption) <= 1024 {
+		return caption, ""
+	}
+	return "", caption
+}
+
+// Stop gracefully shuts down the adapter.
+func (a *Adapter) Stop() error {
+	a.mu.Lock()
+	cancel := a.cancel
+	a.cancel = nil
+	a.running = false
+	a.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	// Wait for the polling goroutine to fully exit before returning, so a
+	// subsequent Start() cannot create a second concurrent poller (which
+	// previously caused duplicate-process behavior after /restart).
+	a.wg.Wait()
+	return nil
+}
+
+// Send sends a message to a chat, splitting if necessary.
+func (a *Adapter) Send(ctx context.Context, chatID string, message string) error {
+	_, err := a.SendWithReceipt(ctx, chatID, message)
+	return err
+}
+
+// SendControl is used for restart diagnostics while polling is temporarily
+// stopped. Normal traffic must continue to use Send and its readiness gate.
+func (a *Adapter) SendControl(ctx context.Context, chatID string, message string) error {
+	a.mu.RLock()
+	bot := a.bot
+	a.mu.RUnlock()
+	if bot == nil {
+		return fmt.Errorf("telegram: bot is not initialized")
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(chatID), 10, 64)
+	if err != nil {
+		return fmt.Errorf("telegram: invalid chat ID %q: %w", chatID, err)
+	}
+	_, err = bot.Send(tgbotapi.NewMessage(id, sanitizeOutgoingText(message)))
+	return err
+}
+
+// SendWithReceipt sends a message and returns the first Telegram message ID.
+func (a *Adapter) SendWithReceipt(ctx context.Context, chatID string, message string) (gateway.SentMessage, error) {
+	if err := a.ensureReady(); err != nil {
+		return gateway.SentMessage{}, err
+	}
+
+	message = sanitizeOutgoingText(message)
+	chunks := a.splitMessage(message)
+	chatIDInt, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return gateway.SentMessage{}, fmt.Errorf("telegram: invalid chat ID %q: %w", chatID, err)
+	}
+
+	receipt := gateway.SentMessage{ChatID: chatID}
+	for _, chunk := range chunks {
+		sentID, err := a.sendChunk(ctx, chatIDInt, 0, chunk)
+		if err != nil {
+			return gateway.SentMessage{}, err
+		}
+		if receipt.ID == "" && sentID > 0 {
+			receipt.ID = strconv.Itoa(sentID)
+		}
+		// Rate limit between chunks
+		a.waitRateLimit(chatID)
+	}
+
+	return receipt, nil
+}
+
+// SendHTML sends a pre-rendered Telegram HTML message without markdown reformatting.
+func (a *Adapter) SendHTML(ctx context.Context, chatID string, message string) error {
+	_, err := a.SendHTMLWithReceipt(ctx, chatID, message)
+	return err
+}
+
+func (a *Adapter) SendHTMLWithReceipt(ctx context.Context, chatID string, message string) (gateway.SentMessage, error) {
+	if err := a.ensureReady(); err != nil {
+		return gateway.SentMessage{}, err
+	}
+
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return gateway.SentMessage{}, nil
+	}
+	chunks := a.splitHTMLMessage(message)
+	chatIDInt, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return gateway.SentMessage{}, fmt.Errorf("telegram: invalid chat ID %q: %w", chatID, err)
+	}
+
+	receipt := gateway.SentMessage{ChatID: chatID}
+	for _, chunk := range chunks {
+		sent, err := a.sendTelegramText(chatIDInt, 0, 0, chunk, tgbotapi.ModeHTML)
+		if err != nil {
+			return gateway.SentMessage{}, fmt.Errorf("telegram: send html message: %w", err)
+		}
+		if receipt.ID == "" && sent.MessageID > 0 {
+			receipt.ID = strconv.Itoa(sent.MessageID)
+		}
+		a.waitRateLimit(chatID)
+	}
+
+	return receipt, nil
+}
+
+func (a *Adapter) EditHTML(ctx context.Context, chatID, messageID, message string, markup *tgbotapi.InlineKeyboardMarkup) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+	chatIDInt, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("telegram: invalid chat ID %q: %w", chatID, err)
+	}
+	messageIDInt, err := strconv.Atoi(messageID)
+	if err != nil {
+		return fmt.Errorf("telegram: invalid message ID %q: %w", messageID, err)
+	}
+	edit := tgbotapi.NewEditMessageText(chatIDInt, messageIDInt, message)
+	edit.ParseMode = tgbotapi.ModeHTML
+	if markup != nil {
+		edit.ReplyMarkup = markup
+	}
+	_, err = a.bot.Send(edit)
+	return err
+}
+
+func (a *Adapter) AnswerCallback(callbackID, text string) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+	_, err := a.bot.Request(tgbotapi.NewCallback(callbackID, text))
+	return err
+}
+
+// SendWithReply sends a message as a reply to a specific message.
+func (a *Adapter) SendWithReply(ctx context.Context, chatID string, replyToMsgID string, message string) error {
+	_, err := a.SendWithReplyReceipt(ctx, chatID, replyToMsgID, message)
+	return err
+}
+
+// SendWithReplyReceipt sends a reply and returns the first Telegram message ID.
+func (a *Adapter) SendWithReplyReceipt(ctx context.Context, chatID string, replyToMsgID string, message string) (gateway.SentMessage, error) {
+	if err := a.ensureReady(); err != nil {
+		return gateway.SentMessage{}, err
+	}
+
+	message = sanitizeOutgoingText(message)
+	chunks := a.splitMessage(message)
+	chatIDInt, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return gateway.SentMessage{}, fmt.Errorf("telegram: invalid chat ID %q: %w", chatID, err)
+	}
+
+	replyToID, err := strconv.Atoi(replyToMsgID)
+	if err != nil {
+		return gateway.SentMessage{}, fmt.Errorf("telegram: invalid reply-to message ID %q: %w", replyToMsgID, err)
+	}
+	threadID := a.threadIDForReply(chatID, replyToMsgID)
+
+	receipt := gateway.SentMessage{ChatID: chatID}
+	for _, chunk := range chunks {
+		sentID, err := a.sendChunkWithThread(ctx, chatIDInt, replyToID, threadID, chunk)
+		if err != nil {
+			return gateway.SentMessage{}, err
+		}
+		if receipt.ID == "" && sentID > 0 {
+			receipt.ID = strconv.Itoa(sentID)
+		}
+		a.waitRateLimit(chatID)
+	}
+
+	return receipt, nil
+}
+
+// SendWithReplyHTML sends a pre-rendered Telegram HTML message as a reply.
+func (a *Adapter) SendWithReplyHTML(ctx context.Context, chatID string, replyToMsgID string, message string) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return nil
+	}
+	chunks := a.splitHTMLMessage(message)
+	chatIDInt, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("telegram: invalid chat ID %q: %w", chatID, err)
+	}
+
+	replyToID, err := strconv.Atoi(replyToMsgID)
+	if err != nil {
+		return fmt.Errorf("telegram: invalid reply-to message ID %q: %w", replyToMsgID, err)
+	}
+	threadID := a.threadIDForReply(chatID, replyToMsgID)
+
+	for _, chunk := range chunks {
+		if err := a.sendChunkHTMLWithThread(ctx, chatIDInt, replyToID, threadID, chunk); err != nil {
+			return err
+		}
+		a.waitRateLimit(chatID)
+	}
+
+	return nil
+}
+
+// SendPhoto sends a photo to a chat, optionally replying to a message. If the
+// caption doesn't fit Telegram's inline caption limit, the full caption is
+// sent as a separate follow-up text message instead of being truncated.
+func (a *Adapter) SendPhoto(ctx context.Context, chatID string, replyToMsgID string, source string, caption string) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+
+	chatIDInt, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("telegram: invalid chat ID %q: %w", chatID, err)
+	}
+
+	replyToID, err := parseReplyToMessageID(replyToMsgID)
+	if err != nil {
+		return err
+	}
+
+	fileData, err := telegramRequestFileData(source)
+	if err != nil {
+		return err
+	}
+
+	inlineCaption, overflow := splitTelegramCaption(formatTelegramRichText(caption))
+
+	msg := tgbotapi.NewPhoto(chatIDInt, fileData)
+	msg.Caption = inlineCaption
+	msg.ParseMode = tgbotapi.ModeHTML
+	if replyToID > 0 {
+		msg.ReplyToMessageID = replyToID
+	}
+
+	sent, err := a.bot.Send(msg)
+	if err != nil {
+		return fmt.Errorf("telegram: send photo: %w", err)
+	}
+
+	if overflow != "" {
+		if err := a.SendWithReplyHTML(ctx, chatID, strconv.Itoa(sent.MessageID), overflow); err != nil {
+			return fmt.Errorf("telegram: send photo caption follow-up: %w", err)
+		}
+	}
+	return nil
+}
+
+// SendDocument sends a document to a chat, optionally replying to a message.
+// If the caption doesn't fit Telegram's inline caption limit, the full
+// caption is sent as a separate follow-up text message instead of being
+// truncated.
+func (a *Adapter) SendDocument(ctx context.Context, chatID string, replyToMsgID string, source string, caption string) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+
+	chatIDInt, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("telegram: invalid chat ID %q: %w", chatID, err)
+	}
+
+	replyToID, err := parseReplyToMessageID(replyToMsgID)
+	if err != nil {
+		return err
+	}
+
+	fileData, err := telegramRequestFileData(source)
+	if err != nil {
+		return err
+	}
+
+	inlineCaption, overflow := splitTelegramCaption(formatTelegramRichText(caption))
+
+	msg := tgbotapi.NewDocument(chatIDInt, fileData)
+	msg.Caption = inlineCaption
+	msg.ParseMode = tgbotapi.ModeHTML
+	if replyToID > 0 {
+		msg.ReplyToMessageID = replyToID
+	}
+
+	sent, err := a.bot.Send(msg)
+	if err != nil {
+		return fmt.Errorf("telegram: send document: %w", err)
+	}
+
+	if overflow != "" {
+		if err := a.SendWithReplyHTML(ctx, chatID, strconv.Itoa(sent.MessageID), overflow); err != nil {
+			return fmt.Errorf("telegram: send document caption follow-up: %w", err)
+		}
+	}
+	return nil
+}
+
+// IsRunning returns whether the adapter is currently connected.
+func (a *Adapter) IsRunning() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.running
+}
+
+// ensureReady reports whether the adapter can send Telegram API traffic.
+// Stop() clears running but keeps bot for faster restart; callers must not
+// treat a non-nil bot alone as "connected".
+func (a *Adapter) ensureReady() error {
+	if a == nil {
+		return fmt.Errorf("telegram: adapter not running")
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.running || a.bot == nil {
+		return fmt.Errorf("telegram: adapter not running")
+	}
+	return nil
+}
+
+// SendTypingLoop 持续发送 typing indicator，直到 ctx 被取消。
+// Telegram 的 typing 状态持续 5 秒，所以每 4.5 秒刷新一次。
+func (a *Adapter) SendTypingLoop(ctx context.Context, chatID string) {
+	if a.ensureReady() != nil {
+		return
+	}
+	chatIDInt, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return
+	}
+
+	ticker := time.NewTicker(4500 * time.Millisecond)
+	defer ticker.Stop()
+
+	// 立即发一次
+	a.sendTypingOnce(chatIDInt)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.sendTypingOnce(chatIDInt)
+		}
+	}
+}
+
+// sendTypingOnce 发送一次 typing action
+func (a *Adapter) sendTypingOnce(chatID int64) {
+	action := tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping)
+	a.bot.Request(action) // 忽略错误，typing 是 best-effort
+}
+
+// ReactToMessage 给消息添加 emoji reaction（👍 等）
+// 使用 Telegram Bot API setMessageReaction（v5.5.1 未封装，复用 bot HTTP client 调用）
+func (a *Adapter) ReactToMessage(chatID string, messageID string, emoji string) {
+	// Reactions are best-effort acknowledgements and fire during inbound
+	// polling, including tests and restart windows that inject a bot without
+	// flipping the long-poll running flag. Require a client, not IsRunning.
+	if a == nil || a.bot == nil {
+		return
+	}
+	emoji = strings.TrimSpace(emoji)
+	if emoji == "" {
+		return
+	}
+
+	chatIDInt, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return
+	}
+	msgIDInt, err := strconv.Atoi(messageID)
+	if err != nil {
+		return
+	}
+
+	// Best effort: a reaction failure must not interrupt the chat handler, but
+	// the route is retained in the warning so permissions/API failures can be
+	// diagnosed from gateway logs.
+	go func() {
+		if err := a.callSetMessageReaction(chatIDInt, msgIDInt, emoji); err != nil {
+			fmt.Printf("[telegram] setMessageReaction failed: %v\n", err)
+		}
+	}()
+}
+
+// callSetMessageReaction 调用 Telegram setMessageReaction API
+func (a *Adapter) callSetMessageReaction(chatID int64, messageID int, emoji string) error {
+	if a.bot == nil {
+		return fmt.Errorf("telegram: setMessageReaction chat_id=%d message_id=%d: bot is not initialized", chatID, messageID)
+	}
+	params := tgbotapi.Params{
+		"chat_id":    strconv.FormatInt(chatID, 10),
+		"message_id": strconv.Itoa(messageID),
+	}
+	if err := params.AddInterface("reaction", []map[string]string{
+		{
+			"type":  "emoji",
+			"emoji": emoji,
+		},
+	}); err != nil {
+		return fmt.Errorf("telegram: setMessageReaction chat_id=%d message_id=%d: encode reaction: %w", chatID, messageID, err)
+	}
+	_, err := a.bot.MakeRequest("setMessageReaction", params)
+	if err != nil {
+		return fmt.Errorf("telegram: setMessageReaction chat_id=%d message_id=%d: %w", chatID, messageID, err)
+	}
+	return nil
+}
+
+// callTelegramAPI 调用 Telegram Bot API 的通用方法
+func (a *Adapter) callTelegramAPI(method string, params url.Values) ([]byte, error) {
+	if a.bot == nil {
+		return nil, fmt.Errorf("telegram: bot is not initialized")
+	}
+	apiParams := tgbotapi.Params{}
+	for key, values := range params {
+		if len(values) > 0 {
+			apiParams[key] = values[0]
+		}
+	}
+	resp, err := a.bot.MakeRequest(method, apiParams)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(resp)
+}
+
+// SendStream implements gateway.StreamGateway.
+// Creates a streaming message that can be updated in real-time.
+func (a *Adapter) SendStream(ctx context.Context, chatID string, replyToMsgID string) (gateway.StreamSender, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+
+	chatIDInt, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("telegram: invalid chat ID %q: %w", chatID, err)
+	}
+
+	replyToID := 0
+	if replyToMsgID != "" {
+		replyToID, _ = strconv.Atoi(replyToMsgID)
+	}
+	threadID := a.threadIDForReply(chatID, replyToMsgID)
+
+	// 发送初始 "思考中" 消息
+	initialText := "🧠 Thinking..."
+	msg := tgbotapi.NewMessage(chatIDInt, initialText)
+	if replyToID > 0 {
+		msg.ReplyToMessageID = replyToID
+	}
+
+	sent, err := a.bot.Send(msg)
+	if err != nil && replyToID > 0 {
+		msg.ReplyToMessageID = 0
+		sent, err = a.bot.Send(msg)
+		replyToID = 0
+	}
+	if err != nil {
+		return nil, fmt.Errorf("telegram: send stream initial: %w", err)
+	}
+
+	return &telegramStreamSender{
+		adapter:   a,
+		chatID:    chatIDInt,
+		messageID: sent.MessageID,
+		chatIDStr: chatID,
+		replyToID: replyToID,
+		threadID:  threadID,
+		content:   "",
+		thinking:  "🧠 Thinking...",
+		editCount: 0,
+		lastEdit:  time.Now(),
+	}, nil
+}
+
+// telegramStreamSender implements gateway.StreamSender for Telegram.
+type telegramStreamSender struct {
+	adapter   *Adapter
+	chatID    int64
+	messageID int
+	chatIDStr string
+	replyToID int
+	threadID  int
+
+	mu         sync.Mutex
+	content    string // 已生成的正文内容
+	thinking   string // 当前思考/工具调用标签
+	editCount  int
+	lastEdit   time.Time
+	finished   bool
+	flushTimer *time.Timer
+	flushGen   uint64
+}
+
+// minEditInterval 是两次消息编辑之间的最小间隔（避免触发 Telegram 限流）
+const minEditInterval = 800 * time.Millisecond
+
+// maxEdits 是单条消息最大编辑次数（超过后不再编辑，等 Finish 一次性更新）
+const maxEdits = 40
+
+func (s *telegramStreamSender) Append(content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.finished {
+		return fmt.Errorf("stream sender already finished")
+	}
+
+	s.content += content
+	// 追加内容时清除思考标签
+	s.thinking = ""
+	return s.throttledEdit()
+}
+
+func (s *telegramStreamSender) SetThinking(label string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.finished {
+		return nil
+	}
+
+	s.thinking = fmt.Sprintf("🧠 %s", label)
+	return s.throttledEdit()
+}
+
+func (s *telegramStreamSender) SetToolCall(name, args string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.finished {
+		return nil
+	}
+
+	if strings.TrimSpace(args) == "" {
+		s.thinking = fmt.Sprintf("🔧 %s", name)
+		return s.throttledEdit()
+	}
+
+	// 截断过长的参数
+	shortArgs := args
+	if len(shortArgs) > 80 {
+		shortArgs = shortArgs[:77] + "..."
+	}
+	s.thinking = fmt.Sprintf("🔧 %s(%s)", name, shortArgs)
+	return s.throttledEdit()
+}
+
+func (s *telegramStreamSender) SetResult(content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.finished {
+		return nil
+	}
+
+	s.content = sanitizeOutgoingText(content)
+	s.thinking = ""
+	return s.throttledEdit()
+}
+
+func (s *telegramStreamSender) SetHTMLCard(content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.finished {
+		return nil
+	}
+
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil
+	}
+	s.cancelScheduledEditLocked()
+	s.content = content
+	s.thinking = ""
+	return s.editMessageHTML(content)
+}
+
+func (s *telegramStreamSender) Finish() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.finished {
+		return nil
+	}
+	s.cancelScheduledEditLocked()
+	s.finished = true
+	s.thinking = ""
+
+	content := sanitizeOutgoingText(s.content)
+	if content == "" {
+		return s.editMessageHTML("🧠 Thinking...")
+	}
+
+	chunks := s.adapter.splitMessage(content)
+	if err := s.editMessageHTML(chunks[0]); err != nil {
+		return err
+	}
+	for _, chunk := range chunks[1:] {
+		if _, err := s.adapter.sendChunkWithThread(context.Background(), s.chatID, s.replyToID, s.threadID, chunk); err != nil {
+			return err
+		}
+		s.adapter.waitRateLimit(s.chatIDStr)
+	}
+	return nil
+}
+
+func (s *telegramStreamSender) MessageID() string {
+	return strconv.Itoa(s.messageID)
+}
+
+// throttledEdit 限流编辑：避免过于频繁调用 Telegram API
+func (s *telegramStreamSender) throttledEdit() error {
+	// 超过最大编辑次数，跳过中间编辑
+	if s.editCount >= maxEdits {
+		return nil
+	}
+
+	// 距离上次编辑太近，跳过
+	if sinceLastEdit := time.Since(s.lastEdit); sinceLastEdit < minEditInterval {
+		s.scheduleEditLocked(minEditInterval - sinceLastEdit)
+		return nil
+	}
+
+	s.cancelScheduledEditLocked()
+	display := s.renderContent()
+	return s.editMessage(display)
+}
+
+// scheduleEditLocked coalesces rapid provider chunks into one Telegram edit.
+// The caller must hold s.mu.
+func (s *telegramStreamSender) scheduleEditLocked(delay time.Duration) {
+	if s.finished || s.editCount >= maxEdits || s.flushTimer != nil {
+		return
+	}
+	if delay < 0 {
+		delay = 0
+	}
+	s.flushGen++
+	flushGen := s.flushGen
+	s.flushTimer = time.AfterFunc(delay, func() {
+		s.flushScheduledEdit(flushGen)
+	})
+}
+
+// cancelScheduledEditLocked prevents a stale delayed edit from overwriting a
+// final response or an HTML progress card. The caller must hold s.mu.
+func (s *telegramStreamSender) cancelScheduledEditLocked() {
+	if s.flushTimer == nil {
+		return
+	}
+	s.flushTimer.Stop()
+	s.flushTimer = nil
+	s.flushGen++
+}
+
+func (s *telegramStreamSender) flushScheduledEdit(flushGen uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if flushGen != s.flushGen {
+		return
+	}
+	s.flushTimer = nil
+	if s.finished || s.editCount >= maxEdits {
+		return
+	}
+	_ = s.editMessage(s.renderContent())
+}
+
+// renderContent 渲染当前消息内容：思考标签 + 正文
+func (s *telegramStreamSender) renderContent() string {
+	var sb strings.Builder
+
+	// 思考/工具调用标签（作为前缀）
+	if s.thinking != "" {
+		sb.WriteString(s.thinking)
+		sb.WriteString("\n\n")
+	}
+
+	// 正文内容
+	if s.content != "" {
+		content := s.content
+		// 预留思考标签的空间
+		maxLen := 3900
+		if s.thinking != "" {
+			maxLen -= len(s.thinking) + 2
+		}
+		content = truncateTelegramMarkdownForRender(content, maxLen)
+		sb.WriteString(content)
+	}
+
+	// 如果两者都为空，显示默认思考状态
+	if s.thinking == "" && s.content == "" {
+		return "🧠 Thinking..."
+	}
+
+	return sanitizeOutgoingText(sb.String())
+}
+
+// editMessage 调用 Telegram API 编辑消息
+func (s *telegramStreamSender) editMessage(text string) error {
+	return s.editMessageWithMode(text, "")
+}
+
+func (s *telegramStreamSender) editMessageHTML(text string) error {
+	return s.editMessageWithMode(formatTelegramRichText(text), tgbotapi.ModeHTML)
+}
+
+func (s *telegramStreamSender) editMessageWithMode(text string, parseMode string) error {
+	if s.adapter.bot == nil {
+		return fmt.Errorf("bot not available")
+	}
+
+	edit := tgbotapi.NewEditMessageText(s.chatID, s.messageID, text)
+	// 中间流式编辑默认保持纯文本；最终落版可切到 HTML。
+	edit.ParseMode = parseMode
+
+	_, err := s.adapter.bot.Send(edit)
+	if err != nil {
+		// 编辑失败不中断流，静默忽略
+		return nil
+	}
+
+	s.editCount++
+	s.lastEdit = time.Now()
+	return nil
+}
+
+// poll runs the long-polling loop.
+func (a *Adapter) poll(ctx context.Context) {
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = a.cfg.PollTimeout
+	// Telegram persists allowed_updates across calls. Declare channel_post
+	// explicitly so a previous webhook/poll configuration cannot silently
+	// prevent channel messages from reaching the reaction handler.
+	u.AllowedUpdates = []string{
+		tgbotapi.UpdateTypeMessage,
+		tgbotapi.UpdateTypeChannelPost,
+		tgbotapi.UpdateTypeCallbackQuery,
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		response, err := a.bot.Request(u)
+		if err != nil {
+			fmt.Printf("[telegram] get updates failed: %v\n", err)
+			if !waitForTelegramPollRetry(ctx) {
+				return
+			}
+			continue
+		}
+
+		updates, err := decodeTelegramTopicUpdates(response.Result)
+		if err != nil {
+			fmt.Printf("[telegram] decode updates failed: %v\n", err)
+			if !waitForTelegramPollRetry(ctx) {
+				return
+			}
+			continue
+		}
+
+		for _, update := range updates {
+			if update.UpdateID < u.Offset {
+				continue
+			}
+			u.Offset = update.UpdateID + 1
+			// Channel posts arrive in channel_post rather than message. Both are
+			// ordinary inbound content for this adapter, so keep them on the same
+			// processing path.
+			if update.Message == nil && update.ChannelPost == nil {
+				continue
+			}
+			a.processUpdateWithThreadID(ctx, update.Update, update.MessageThreadID)
+		}
+	}
+}
+
+func waitForTelegramPollRetry(ctx context.Context) bool {
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// processUpdate converts a Telegram update to a gateway.Message and dispatches it.
+func (a *Adapter) processUpdate(ctx context.Context, update tgbotapi.Update) {
+	a.processUpdateWithThreadID(ctx, update, "")
+}
+
+func (a *Adapter) processUpdateWithThreadID(ctx context.Context, update tgbotapi.Update, threadID string) {
+	if update.CallbackQuery != nil {
+		a.mu.RLock()
+		callbackHandler := a.callbackHandler
+		a.mu.RUnlock()
+		if callbackHandler != nil {
+			callbackHandler(ctx, update.CallbackQuery)
+		}
+		return
+	}
+	tgMsg := update.Message
+	if tgMsg == nil {
+		tgMsg = update.ChannelPost
+	}
+	if tgMsg == nil || tgMsg.Chat == nil {
+		return
+	}
+	a.rememberTelegramThread(strconv.FormatInt(tgMsg.Chat.ID, 10), strconv.Itoa(tgMsg.MessageID), threadID)
+
+	chatID := strconv.FormatInt(tgMsg.Chat.ID, 10)
+	senderName := ""
+	if tgMsg.From != nil {
+		senderName = tgMsg.From.UserName
+	} else if tgMsg.SenderChat != nil {
+		senderName = tgMsg.SenderChat.UserName
+	}
+	fmt.Printf("[telegram] received msg: chatID=%s, chatType=%s, from=%v, text=%q\n",
+		chatID, tgMsg.Chat.Type, senderName, func() string {
+			if len(tgMsg.Text) > 80 {
+				return tgMsg.Text[:80]
+			}
+			return tgMsg.Text
+		}())
+
+	// Check chat whitelist
+	if !a.cfg.IsChatAllowed(chatID) {
+		return
+	}
+
+	msg := a.convertMessageWithThreadID(tgMsg, threadID)
+
+	// In group chats, only respond to @bot mentions or replies to bot's own messages
+	if msg.Chat.Type != gateway.ChatPrivate && msg.Chat.Type != gateway.ChatChannel {
+		mentioned := a.isMentioned(tgMsg)
+		replyToBot := a.isReplyToBot(tgMsg)
+		fmt.Printf("[telegram] group msg: chatID=%s, mentioned=%v, replyToBot=%v, botUsername=%s, text=%q\n",
+			chatID, mentioned, replyToBot, a.botUsername, msg.Text[:min(80, len(msg.Text))])
+		if !mentioned && !replyToBot {
+			// Privacy/trigger filtering controls Agent dispatch, not receipt
+			// feedback. Confirm ordinary group messages without forwarding them.
+			if !a.cfg.DisableAutoReaction {
+				a.ReactToMessage(msg.Chat.ID, msg.ID, "👍")
+			}
+			return
+		}
+		// Strip @botusername from text
+		if a.botUsername != "" {
+			msg.Text = strings.ReplaceAll(msg.Text, "@"+a.botUsername, "")
+			msg.Text = strings.TrimSpace(msg.Text)
+			msg.Args = strings.TrimSpace(strings.TrimPrefix(msg.Args, "@"+a.botUsername))
+		}
+		// 标记群聊触发方式，供 handler 使用
+		msg.IsGroupTrigger = true
+		msg.TriggerType = "mention"
+		if replyToBot && !mentioned {
+			msg.TriggerType = "reply"
+		}
+	}
+
+	a.mu.RLock()
+	handler := a.handler
+	a.mu.RUnlock()
+
+	if handler != nil {
+		if err := handler(ctx, msg); err != nil {
+			fmt.Printf("[telegram] handler error: %v\n", err)
+		}
+	}
+}
+
+// convertMessage converts a Telegram message to a gateway.Message.
+func (a *Adapter) convertMessage(tgMsg *tgbotapi.Message) *gateway.Message {
+	return a.convertMessageWithThreadID(tgMsg, "")
+}
+
+func (a *Adapter) convertMessageWithThreadID(tgMsg *tgbotapi.Message, threadID string) *gateway.Message {
+	return a.convertMessageWithAttachmentsAndThreadID(tgMsg, true, threadID)
+}
+
+func (a *Adapter) convertMessageWithAttachments(tgMsg *tgbotapi.Message, includeAttachments bool) *gateway.Message {
+	return a.convertMessageWithAttachmentsAndThreadID(tgMsg, includeAttachments, "")
+}
+
+func (a *Adapter) convertMessageWithAttachmentsAndThreadID(tgMsg *tgbotapi.Message, includeAttachments bool, threadID string) *gateway.Message {
+	if tgMsg == nil || tgMsg.Chat == nil {
+		return nil
+	}
+	chatType := gateway.ChatPrivate
+	switch tgMsg.Chat.Type {
+	case "group":
+		chatType = gateway.ChatGroup
+	case "supergroup":
+		chatType = gateway.ChatSuperGroup
+	case "channel":
+		chatType = gateway.ChatChannel
+	}
+
+	sender := gateway.User{}
+	if tgMsg.From != nil {
+		sender = gateway.User{
+			ID:        strconv.FormatInt(tgMsg.From.ID, 10),
+			Username:  tgMsg.From.UserName,
+			FirstName: tgMsg.From.FirstName,
+			LastName:  tgMsg.From.LastName,
+		}
+	} else if tgMsg.SenderChat != nil {
+		sender = gateway.User{
+			ID:        strconv.FormatInt(tgMsg.SenderChat.ID, 10),
+			Username:  tgMsg.SenderChat.UserName,
+			FirstName: tgMsg.SenderChat.Title,
+		}
+	}
+
+	msg := &gateway.Message{
+		ID:       strconv.Itoa(tgMsg.MessageID),
+		ThreadID: strings.TrimSpace(threadID),
+		Chat: gateway.Chat{
+			ID:       strconv.FormatInt(tgMsg.Chat.ID, 10),
+			Type:     chatType,
+			Title:    tgMsg.Chat.Title,
+			Username: tgMsg.Chat.UserName,
+		},
+		Sender:    sender,
+		Text:      tgMsg.Text,
+		Timestamp: time.Unix(int64(tgMsg.Date), 0),
+	}
+	if strings.TrimSpace(msg.Text) == "" {
+		msg.Text = tgMsg.Caption
+	}
+
+	if includeAttachments {
+		// v0.36.0: 提取多媒体附件
+		a.extractAttachments(tgMsg, msg)
+	}
+
+	// 如果没有文本但有附件，构造描述文本
+	if msg.Text == "" && len(msg.Attachments) > 0 {
+		var parts []string
+		for _, att := range msg.Attachments {
+			switch att.Type {
+			case gateway.AttachmentImage:
+				parts = append(parts, "[用户发送了一张图片]")
+			case gateway.AttachmentAudio:
+				parts = append(parts, "[用户发送了一段语音]")
+			case gateway.AttachmentVideo:
+				parts = append(parts, "[用户发送了一段视频]")
+			case gateway.AttachmentDocument:
+				parts = append(parts, fmt.Sprintf("[用户发送了文件: %s]", att.FileName))
+			}
+		}
+		msg.Text = strings.Join(parts, " ")
+	}
+
+	// Parse command
+	if tgMsg.IsCommand() {
+		msg.IsCommand = true
+		msg.Command = tgMsg.Command()
+		msg.Args = tgMsg.CommandArguments()
+	}
+
+	// Parse reply
+	if tgMsg.ReplyToMessage != nil {
+		replyMsg := a.convertMessageWithAttachmentsAndThreadID(tgMsg.ReplyToMessage, true, threadID)
+		msg.ReplyTo = replyMsg
+	}
+
+	return msg
+}
+
+// extractAttachments 从 Telegram 消息中提取多媒体附件
+func (a *Adapter) extractAttachments(tgMsg *tgbotapi.Message, msg *gateway.Message) {
+	if a.bot == nil {
+		return
+	}
+
+	// 图片
+	if tgMsg.Photo != nil && len(tgMsg.Photo) > 0 {
+		// 取最大尺寸的图片
+		photo := tgMsg.Photo[len(tgMsg.Photo)-1]
+		a.appendTelegramAttachment(msg, gateway.Attachment{
+			Type:     gateway.AttachmentImage,
+			FileID:   photo.FileID,
+			FileName: "photo.jpg",
+			MimeType: "image/jpeg",
+			FileSize: int64(photo.FileSize),
+		})
+	}
+
+	// 语音消息
+	if tgMsg.Voice != nil {
+		a.appendTelegramAttachment(msg, gateway.Attachment{
+			Type:     gateway.AttachmentAudio,
+			FileID:   tgMsg.Voice.FileID,
+			FileName: "voice.ogg",
+			MimeType: tgMsg.Voice.MimeType,
+			FileSize: int64(tgMsg.Voice.FileSize),
+		})
+	}
+
+	// 音频文件
+	if tgMsg.Audio != nil {
+		a.appendTelegramAttachment(msg, gateway.Attachment{
+			Type:     gateway.AttachmentAudio,
+			FileID:   tgMsg.Audio.FileID,
+			FileName: tgMsg.Audio.FileName,
+			MimeType: tgMsg.Audio.MimeType,
+			FileSize: int64(tgMsg.Audio.FileSize),
+		})
+	}
+
+	// 视频
+	if tgMsg.Video != nil {
+		a.appendTelegramAttachment(msg, gateway.Attachment{
+			Type:     gateway.AttachmentVideo,
+			FileID:   tgMsg.Video.FileID,
+			FileName: tgMsg.Video.FileName,
+			MimeType: tgMsg.Video.MimeType,
+			FileSize: int64(tgMsg.Video.FileSize),
+		})
+	}
+
+	// GIF/animation
+	if tgMsg.Animation != nil {
+		a.appendTelegramAttachment(msg, gateway.Attachment{
+			Type:     gateway.AttachmentVideo,
+			FileID:   tgMsg.Animation.FileID,
+			FileName: tgMsg.Animation.FileName,
+			MimeType: tgMsg.Animation.MimeType,
+			FileSize: int64(tgMsg.Animation.FileSize),
+		})
+	}
+
+	// 圆形视频消息
+	if tgMsg.VideoNote != nil {
+		a.appendTelegramAttachment(msg, gateway.Attachment{
+			Type:     gateway.AttachmentVideo,
+			FileID:   tgMsg.VideoNote.FileID,
+			FileName: "video_note.mp4",
+			MimeType: "video/mp4",
+			FileSize: int64(tgMsg.VideoNote.FileSize),
+		})
+	}
+
+	// 贴纸：静态贴纸作为图片处理，动态贴纸保留为文档附件。
+	if tgMsg.Sticker != nil {
+		attType := gateway.AttachmentImage
+		mimeType := "image/webp"
+		fileName := "sticker.webp"
+		if tgMsg.Sticker.IsAnimated {
+			attType = gateway.AttachmentDocument
+			mimeType = "application/x-tgsticker"
+			fileName = "sticker.tgs"
+		}
+		a.appendTelegramAttachment(msg, gateway.Attachment{
+			Type:     attType,
+			FileID:   tgMsg.Sticker.FileID,
+			FileName: fileName,
+			MimeType: mimeType,
+			FileSize: int64(tgMsg.Sticker.FileSize),
+		})
+	}
+
+	// 文档
+	if tgMsg.Document != nil {
+		a.appendTelegramAttachment(msg, gateway.Attachment{
+			Type:     gateway.AttachmentDocument,
+			FileID:   tgMsg.Document.FileID,
+			FileName: tgMsg.Document.FileName,
+			MimeType: tgMsg.Document.MimeType,
+			FileSize: int64(tgMsg.Document.FileSize),
+		})
+	}
+}
+
+func (a *Adapter) appendTelegramAttachment(msg *gateway.Message, att gateway.Attachment) {
+	if msg == nil {
+		return
+	}
+	if strings.TrimSpace(att.FileID) != "" {
+		if url, err := a.bot.GetFileDirectURL(att.FileID); err == nil {
+			att.FileURL = url
+			a.populateAttachmentData(&att)
+		}
+	}
+	msg.Attachments = append(msg.Attachments, att)
+}
+
+func (a *Adapter) populateAttachmentData(att *gateway.Attachment) {
+	if att == nil || strings.TrimSpace(att.FileURL) == "" || strings.TrimSpace(att.FilePath) != "" {
+		return
+	}
+	limit := a.attachmentDownloadLimit()
+	if att.FileSize > limit {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), a.attachmentDownloadTimeout())
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, att.FileURL, nil)
+	if err != nil {
+		return
+	}
+
+	var client interface {
+		Do(*http.Request) (*http.Response, error)
+	} = http.DefaultClient
+	if a.bot != nil && a.bot.Client != nil {
+		client = a.bot.Client
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return
+	}
+	if resp.ContentLength > limit {
+		return
+	}
+	if ct := strings.TrimSpace(resp.Header.Get("Content-Type")); ct != "" && (att.MimeType == "" || strings.HasSuffix(att.MimeType, "/*")) {
+		att.MimeType = strings.Split(ct, ";")[0]
+	}
+
+	dir, err := telegramAttachmentStorageDir()
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+
+	fileName := telegramAttachmentFileName(att)
+	tmpFile, err := os.CreateTemp(dir, fileName+".*.part")
+	if err != nil {
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		_ = tmpFile.Close()
+	}()
+
+	reader := io.LimitReader(resp.Body, limit+1)
+	written, err := io.Copy(tmpFile, reader)
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if written > limit {
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if att.FileSize == 0 {
+		att.FileSize = written
+	}
+
+	finalPath := filepath.Join(dir, fileName)
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return
+	}
+	att.FilePath = finalPath
+}
+
+func (a *Adapter) attachmentDownloadLimit() int64 {
+	if a == nil || a.cfg.AttachmentDownloadLimit <= 0 {
+		return defaultAttachmentDownloadLimit
+	}
+	return a.cfg.AttachmentDownloadLimit
+}
+
+func (a *Adapter) attachmentDownloadTimeout() time.Duration {
+	if a == nil || a.cfg.AttachmentDownloadTimeout <= 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(a.cfg.AttachmentDownloadTimeout) * time.Second
+}
+
+func telegramAttachmentStorageDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Join(home, ".luckyagent", "workspace", "downloads", "telegram", "attachments"), nil
+	}
+	return filepath.Join(os.TempDir(), "luckyagent", "workspace", "downloads", "telegram", "attachments"), nil
+}
+
+func telegramAttachmentFileName(att *gateway.Attachment) string {
+	name := strings.TrimSpace(att.FileName)
+	if name == "" {
+		switch att.Type {
+		case gateway.AttachmentImage:
+			name = "image"
+		case gateway.AttachmentAudio:
+			name = "audio"
+		case gateway.AttachmentVideo:
+			name = "video"
+		default:
+			name = "document"
+		}
+	}
+
+	name = filepath.Base(name)
+	name = strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+			return '_'
+		default:
+			return r
+		}
+	}, name)
+	if strings.TrimSpace(name) == "" {
+		name = "attachment"
+	}
+	if filepath.Ext(name) == "" {
+		if ext := telegramAttachmentExtension(att.MimeType); ext != "" {
+			name += ext
+		}
+	}
+
+	prefix := strings.TrimSpace(att.FileID)
+	if prefix == "" {
+		prefix = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	prefix = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == '-' || r == '_':
+			return r
+		default:
+			return '_'
+		}
+	}, prefix)
+	return prefix + "_" + name
+}
+
+func telegramAttachmentExtension(mimeType string) string {
+	switch strings.ToLower(strings.TrimSpace(strings.Split(mimeType, ";")[0])) {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/webp":
+		return ".webp"
+	case "image/gif":
+		return ".gif"
+	case "audio/ogg", "audio/opus":
+		return ".ogg"
+	case "audio/mpeg":
+		return ".mp3"
+	case "audio/mp4", "audio/x-m4a":
+		return ".m4a"
+	case "video/mp4":
+		return ".mp4"
+	case "application/pdf":
+		return ".pdf"
+	case "application/x-tgsticker":
+		return ".tgs"
+	}
+	exts, err := mime.ExtensionsByType(strings.TrimSpace(mimeType))
+	if err != nil || len(exts) == 0 {
+		return ""
+	}
+	return exts[0]
+}
+
+// isMentioned checks if the bot is mentioned in the message.
+func (a *Adapter) isMentioned(tgMsg *tgbotapi.Message) bool {
+	if a.botUsername == "" {
+		return false
+	}
+
+	// Check text for @botusername
+	if strings.Contains(tgMsg.Text, "@"+a.botUsername) {
+		return true
+	}
+
+	// Check entities for mention / text_mention
+	for _, entity := range tgMsg.Entities {
+		switch entity.Type {
+		case "mention":
+			mention := tgMsg.Text[entity.Offset : entity.Offset+entity.Length]
+			if mention == "@"+a.botUsername {
+				return true
+			}
+		case "text_mention":
+			// text_mention 用于没有 username 的用户 @bot，检查 User 字段
+			if entity.User != nil && entity.User.UserName == a.botUsername {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// isReplyToBot checks if the message is a reply to the bot's own message.
+func (a *Adapter) isReplyToBot(tgMsg *tgbotapi.Message) bool {
+	if tgMsg.ReplyToMessage == nil {
+		return false
+	}
+	// 检查被回复消息的发送者是否是 bot 自己
+	return tgMsg.ReplyToMessage.From != nil && tgMsg.ReplyToMessage.From.IsBot
+}
+
+func (a *Adapter) rememberTelegramThread(chatID string, messageID string, threadID string) {
+	chatID = strings.TrimSpace(chatID)
+	messageID = strings.TrimSpace(messageID)
+	threadID = strings.TrimSpace(threadID)
+	if chatID == "" || messageID == "" || threadID == "" {
+		return
+	}
+	a.mu.Lock()
+	a.threadIDs[chatID+":"+messageID] = threadID
+	a.mu.Unlock()
+}
+
+func (a *Adapter) threadIDForReply(chatID string, messageID string) int {
+	key := strings.TrimSpace(chatID) + ":" + strings.TrimSpace(messageID)
+	a.mu.RLock()
+	threadID := a.threadIDs[key]
+	a.mu.RUnlock()
+	value, err := strconv.Atoi(threadID)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	return value
+}
+
+// sendChunk sends a single message chunk to Telegram.
+func (a *Adapter) sendChunk(ctx context.Context, chatID int64, replyTo int, text string) (int, error) {
+	return a.sendChunkWithThread(ctx, chatID, replyTo, 0, text)
+}
+
+func (a *Adapter) sendChunkWithThread(_ context.Context, chatID int64, replyTo int, threadID int, text string) (int, error) {
+	plainText := text
+	sent, err := a.sendTelegramText(chatID, replyTo, threadID, formatTelegramRichText(text), tgbotapi.ModeHTML)
+	if err != nil {
+		sent, err = a.sendTelegramText(chatID, replyTo, threadID, plainText, "")
+		if err != nil {
+			return 0, fmt.Errorf("telegram: send message: %w", err)
+		}
+	}
+
+	return sent.MessageID, nil
+}
+
+func (a *Adapter) sendChunkHTML(ctx context.Context, chatID int64, replyTo int, text string) error {
+	return a.sendChunkHTMLWithThread(ctx, chatID, replyTo, 0, text)
+}
+
+func (a *Adapter) sendChunkHTMLWithThread(_ context.Context, chatID int64, replyTo int, threadID int, text string) error {
+	if _, err := a.sendTelegramText(chatID, replyTo, threadID, text, tgbotapi.ModeHTML); err != nil {
+		return fmt.Errorf("telegram: send html message: %w", err)
+	}
+	return nil
+}
+
+func (a *Adapter) sendTelegramText(chatID int64, replyTo int, threadID int, text string, parseMode string) (tgbotapi.Message, error) {
+	params := tgbotapi.Params{}
+	params.AddNonZero64("chat_id", chatID)
+	params.AddNonZero("reply_to_message_id", replyTo)
+	params.AddNonZero("message_thread_id", threadID)
+	params["text"] = text
+	params.AddNonEmpty("parse_mode", parseMode)
+
+	response, err := a.bot.MakeRequest("sendMessage", params)
+	if err != nil {
+		return tgbotapi.Message{}, err
+	}
+	var sent tgbotapi.Message
+	if err := json.Unmarshal(response.Result, &sent); err != nil {
+		return tgbotapi.Message{}, err
+	}
+	return sent, nil
+}
+
+// splitMessage splits a message into chunks that fit within Telegram's 4096 char limit.
+func (a *Adapter) splitMessage(message string) []string {
+	maxLen := a.cfg.MaxMessageLen
+	if maxLen <= 0 || maxLen > 4096 {
+		maxLen = 4096
+	}
+	message = repairTelegramMarkdownFences(message)
+
+	if len(message) <= maxLen {
+		return []string{message}
+	}
+
+	return splitTelegramMessageChunks(message, maxLen)
+}
+
+func (a *Adapter) splitHTMLMessage(message string) []string {
+	maxLen := a.cfg.MaxMessageLen
+	if maxLen <= 0 || maxLen > 4096 {
+		maxLen = 4096
+	}
+	return splitTelegramHTMLChunks(sanitizeTelegramHTML(message), maxLen)
+}
+
+func truncateTelegramMarkdownForRender(text string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	if len(text) <= maxLen {
+		return text
+	}
+
+	const (
+		marker     = "\n...\n"
+		fenceClose = "\n```"
+	)
+	if maxLen <= len(marker)+len(fenceClose) {
+		return truncateTelegramRunes(text, maxLen)
+	}
+
+	limit := maxLen - len(marker)
+	truncated := truncateTelegramRunes(text, limit)
+	truncated = strings.TrimRight(truncated, " \t\r\n")
+	if telegramMarkdownFenceOpen(truncated) {
+		truncated = truncateTelegramRunes(truncated, limit-len(fenceClose))
+		truncated = strings.TrimRight(truncated, " \t\r\n")
+		if telegramMarkdownFenceOpen(truncated) {
+			truncated += fenceClose
+		}
+	}
+	return truncated + marker
+}
+
+func truncateTelegramRunes(text string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	if len(text) <= maxLen {
+		return text
+	}
+	var b strings.Builder
+	for _, r := range text {
+		if b.Len()+len(string(r)) > maxLen {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func telegramMarkdownFenceOpen(text string) bool {
+	inFence := false
+	for _, line := range strings.SplitAfter(text, "\n") {
+		if isMarkdownFenceLine(line) {
+			inFence = !inFence
+		}
+	}
+	return inFence
+}
+
+func splitTelegramMessageChunks(message string, maxLen int) []string {
+	lines := strings.SplitAfter(message, "\n")
+	var chunks []string
+	var current strings.Builder
+	inFence := false
+	pendingFenceReopen := false
+	fenceOpener := ""
+
+	for _, originalLine := range lines {
+		line := originalLine
+		lineIsFence := isMarkdownFenceLine(originalLine)
+
+		for {
+			if pendingFenceReopen && current.Len() == 0 {
+				current.WriteString(fenceOpener)
+				if !strings.HasSuffix(fenceOpener, "\n") {
+					current.WriteString("\n")
+				}
+				pendingFenceReopen = false
+			}
+
+			limit := maxLen
+			if inFence && !lineIsFence {
+				limit -= len("\n```")
+				if limit <= 0 {
+					limit = 1
+				}
+			}
+
+			if current.Len()+len(line) > limit {
+				if current.Len() == 0 || chunkHasOnlyFencePrefix(current.String(), fenceOpener) {
+					take := limit - current.Len()
+					if take <= 0 {
+						take = maxLen
+					}
+					part := truncateTelegramRunes(line, take)
+					if part == "" {
+						for _, r := range line {
+							part = string(r)
+							break
+						}
+					}
+					current.WriteString(part)
+					line = line[len(part):]
+					chunk, reopen := finalizeTelegramChunk(current.String(), inFence)
+					if chunk != "" {
+						chunks = append(chunks, chunk)
+					}
+					current.Reset()
+					pendingFenceReopen = reopen && fenceOpener != ""
+					continue
+				}
+
+				chunk, reopen := finalizeTelegramChunk(current.String(), inFence)
+				if chunk != "" {
+					chunks = append(chunks, chunk)
+				}
+				current.Reset()
+				pendingFenceReopen = reopen && fenceOpener != ""
+				continue
+			}
+
+			current.WriteString(line)
+			break
+		}
+
+		if lineIsFence {
+			trimmed := strings.TrimRight(originalLine, "\n")
+			if !inFence {
+				inFence = true
+				fenceOpener = trimmed
+			} else {
+				inFence = false
+				pendingFenceReopen = false
+				fenceOpener = ""
+			}
+		}
+	}
+
+	if current.Len() > 0 {
+		chunk, _ := finalizeTelegramChunk(current.String(), inFence)
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+	}
+
+	return chunks
+}
+
+func isMarkdownFenceLine(line string) bool {
+	trimmed := strings.TrimSpace(strings.TrimRight(line, "\n"))
+	if len(trimmed) < 3 {
+		return false
+	}
+	return strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~")
+}
+
+func finalizeTelegramChunk(chunk string, inFence bool) (string, bool) {
+	if chunk == "" {
+		return "", false
+	}
+	if !inFence {
+		return chunk, false
+	}
+	if !strings.HasSuffix(chunk, "\n") {
+		chunk += "\n"
+	}
+	chunk += "```"
+	return chunk, true
+}
+
+func chunkHasOnlyFencePrefix(chunk string, fenceOpener string) bool {
+	if fenceOpener == "" {
+		return false
+	}
+	return chunk == fenceOpener || chunk == fenceOpener+"\n"
+}
+
+// waitRateLimit enforces per-chat rate limiting.
+func (a *Adapter) waitRateLimit(chatID string) {
+	a.mu.Lock()
+	bucket, exists := a.rateLimit[chatID]
+	if !exists {
+		bucket = &rateBucket{}
+		a.rateLimit[chatID] = bucket
+	}
+	a.mu.Unlock()
+
+	elapsed := time.Since(bucket.lastSent)
+	minInterval := time.Second / time.Duration(a.cfg.RateLimit)
+	if elapsed < minInterval {
+		time.Sleep(minInterval - elapsed)
+	}
+
+	bucket.lastSent = time.Now()
+}
+
+// Config returns the platform configuration snapshot used by the host assembly.
+func (a *Adapter) Config() Config { return a.cfg }
+
+// NewAdapterWithClient wraps an initialized Bot API client for host-owned
+// update delivery. It starts no polling goroutine; the returned adapter is
+// ready for outbound messages. Use NewAdapter and Start for long polling.
+func NewAdapterWithClient(cfg Config, client *tgbotapi.BotAPI) *Adapter {
+	a := NewAdapter(cfg)
+	if client != nil {
+		a.bot = client
+		a.botUsername = client.Self.UserName
+		a.running = true
+	}
+	return a
+}
+
+// RememberThread associates a reply anchor with a Telegram topic.
+func (a *Adapter) RememberThread(chatID, messageID, threadID string) {
+	a.rememberTelegramThread(chatID, messageID, threadID)
+}
+
+// ProcessUpdate delivers a webhook or externally polled update through the
+// same authorization, topic and attachment handling as the built-in poller.
+func (a *Adapter) ProcessUpdate(ctx context.Context, update tgbotapi.Update) {
+	a.processUpdate(ctx, update)
+}
