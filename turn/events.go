@@ -17,6 +17,7 @@ const (
 	ChatEventApprovalRequired
 	ChatEventReasoningContent
 	ChatEventCompact
+	ChatEventUIDelta
 )
 
 // ChatEvent is the provider- and gateway-neutral event emitted by a turn.
@@ -33,9 +34,27 @@ type ChatEvent struct {
 	Observation *ObservationEvent
 	Approval    *ApprovalEvent
 	Compact     *CompactProgress
+	UI          *UIDelta
 	Usage       *TokenUsage
 	CreatedAt   *time.Time
 	Err         error
+}
+
+// UIDelta is a catalog-validated OpenUI patch. Unknown components must
+// already have been dropped by the runtime catalog.
+type UIDelta struct {
+	TreeID string   `json:"tree_id"`
+	State  string   `json:"state"`
+	Nodes  []UINode `json:"nodes,omitempty"`
+	Patch  bool     `json:"patch,omitempty"`
+}
+
+type UINode struct {
+	ID       string         `json:"id"`
+	Type     string         `json:"type"`
+	Policy   string         `json:"policy,omitempty"`
+	Props    map[string]any `json:"props,omitempty"`
+	Children []string       `json:"children,omitempty"`
 }
 
 type ObservationEvent struct {
