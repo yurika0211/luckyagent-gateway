@@ -23,12 +23,15 @@ const (
 // Err is kept for in-process consumers; transport adapters decide how to
 // serialize it.
 type ChatEvent struct {
-	Type        EventType
-	Content     string
-	TaskID      string
-	Name        string
-	Args        string
-	Result      string
+	Type    EventType
+	Content string
+	TaskID  string
+	Name    string
+	Args    string
+	Result  string
+	// Duration is the finished tool call's wall clock. It is set only on
+	// ChatEventToolResult. Zero means the producer did not measure the call.
+	Duration    time.Duration
 	Round       int
 	Observation *ObservationEvent
 	Approval    *ApprovalEvent
